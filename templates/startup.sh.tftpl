@@ -1,0 +1,143 @@
+#!/bin/bash
+# Portward gateway machine: runs at every boot (Google guest environment). Mounts the records disk, reads the
+# secrets from Secret Manager with the machine's own identity (generating the gateway key the first time), and
+# (re)starts the gateway, Caddy (HTTPS) and, in relay mode, the relay client. Settings come from the deployment:
+# a change there replaces the machine; the records disk and the key carry over.
+# Rendered by Terraform: $${...} is a shell expansion, the rest was filled in at deploy time.
+set -euo pipefail
+umask 077
+
+PROJECT=${project}
+MODE=${mode}
+IMAGE=${gateway_image}
+CADDY_IMAGE=${caddy_image}
+RELAY_IMAGE=${relay_image}
+KEY_SECRET=${key_secret}
+DIRECTORY_SECRET=${directory_secret}
+LICENSE_SECRET=${license_secret}
+DEVICE=/dev/disk/by-id/google-${disk_device}
+DISK=/mnt/disks/portward
+RUN=/run/portward           # tmpfs: secrets for the containers, never on a disk
+MD=http://metadata.google.internal/computeMetadata/v1
+SM=https://secretmanager.googleapis.com/v1/projects/$PROJECT/secrets
+export DOCKER_CONFIG=$RUN/docker
+
+log() { echo "portward: $*"; }
+
+token() {
+  curl -sSf -H 'Metadata-Flavor: Google' "$MD/instance/service-accounts/default/token" \
+    | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p'
+}
+
+# A secret's latest value on stdout. Exit 3 when it has no value yet; retries anything else.
+secret() {
+  local body code tries=0
+  while :; do
+    body=$(mktemp -p "$RUN")
+    code=$(curl -sS -o "$body" -w '%%{http_code}' -H "Authorization: Bearer $(token)" \
+      "$SM/$1/versions/latest:access" || echo 000)
+    if [[ $code == 200 ]]; then
+      sed -n 's/.*"data" *: *"\([^"]*\)".*/\1/p' "$body" | base64 -d
+      rm -f "$body"; return 0
+    fi
+    rm -f "$body"
+    [[ $code == 404 || $code == 400 ]] && return 3   # no version (400: the latest one is disabled or destroyed)
+    tries=$((tries + 1)); (( tries < 10 )) || { log "Secret Manager answered $code for $1"; return 1; }
+    sleep 6
+  done
+}
+
+# Waits until someone adds a value to a secret the deployment left empty.
+wait_secret() {
+  local value status
+  while :; do
+    set +e; value=$(secret "$1"); status=$?; set -e
+    [[ $status == 0 ]] && { printf '%s' "$value"; return 0; }
+    [[ $status == 3 ]] || exit 1
+    log "waiting for secret $1: gcloud secrets versions add $1 --project $PROJECT --data-file=<file>" >&2
+    sleep 30
+  done
+}
+
+# KEY=value from a value that is either just the value or a file of KEY=value lines (as Portward sends them).
+field() {
+  if grep -q "^$1=" <<<"$2"; then sed -n "s/^$1=//p" <<<"$2" | head -n1 | tr -d '\r'; else printf '%s' "$2" | tr -d '\r\n'; fi
+}
+
+mkdir -p "$RUN" "$DOCKER_CONFIG"
+mount | grep -q " $RUN " || mount -t tmpfs -o size=4m,mode=0700 tmpfs "$RUN"
+mkdir -p "$DOCKER_CONFIG"
+
+# --- the records disk (encrypted; snapshotted daily) ---
+for _ in $(seq 60); do [[ -e $DEVICE ]] && break; sleep 2; done
+[[ -e $DEVICE ]] || { log "records disk $DEVICE isn't attached"; exit 1; }
+if ! blkid "$DEVICE" >/dev/null 2>&1; then
+  log "formatting the new records disk"
+  mkfs.ext4 -q -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "$DEVICE"
+fi
+mkdir -p "$DISK"
+mountpoint -q "$DISK" || mount -o discard,defaults,nodev,nosuid "$DEVICE" "$DISK"
+mkdir -p "$DISK/data" "$DISK/caddy" "$DISK/config"
+chown 10001:10001 "$DISK/data"; chmod 700 "$DISK/data"   # the gateway image's user
+
+# --- secrets ---
+set +e; KEY=$(secret "$KEY_SECRET"); status=$?; set -e
+if [[ $status == 3 ]]; then  # first boot: generate the key here, so it exists only in this project
+  log "generating the gateway key in Secret Manager ($KEY_SECRET)"
+  KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  printf '{"payload":{"data":"%s"}}' "$(printf '%s' "$KEY" | base64 -w0)" > "$RUN/key.json"
+  curl -sSf -o /dev/null -X POST -H "Authorization: Bearer $(token)" -H 'Content-Type: application/json' \
+    --data-binary @"$RUN/key.json" "$SM/$KEY_SECRET:addVersion"
+  rm -f "$RUN/key.json"
+  KEY=$(secret "$KEY_SECRET")
+elif [[ $status != 0 ]]; then exit 1; fi
+[[ $${#KEY} -ge 32 ]] || { log "the key in $KEY_SECRET is too short"; exit 1; }
+RAW=$(wait_secret "$DIRECTORY_SECRET")
+DIRECTORY=$(field PORTWARD_DIRECTORY_SECRET "$RAW")
+printf 'PORTWARD_KEY=%s\nPORTWARD_DIRECTORY_SECRET=%s\nFORWARDED_ALLOW_IPS=*\n' "$KEY" "$DIRECTORY" > "$RUN/gateway.env"
+unset KEY DIRECTORY RAW
+# The license key: the image pull password and the relay key.
+LICENSE=$(wait_secret "$LICENSE_SECRET" | tr -d '\r\n')
+[[ $LICENSE =~ ^pwlic_[a-z0-9][a-z0-9-]{1,40}_[0-9a-f]{64}$ ]] || { log "$LICENSE_SECRET doesn't hold a license key"; exit 1; }
+[[ $MODE == relay ]] && printf 'RELAY_TOKEN=%s\n' "$LICENSE" > "$RUN/relay.env"
+
+# --- settings ---
+cat > "$DISK/config/portward.toml" <<'PORTWARD_EOF'
+${portward_toml}
+PORTWARD_EOF
+cat > "$DISK/config/Caddyfile" <<'PORTWARD_EOF'
+${caddyfile}
+PORTWARD_EOF
+cat > "$DISK/config/relay.toml" <<'PORTWARD_EOF'
+${relay_toml}
+PORTWARD_EOF
+chmod 644 "$DISK/config/"*
+
+# --- the image ---
+REGISTRY=$${IMAGE%%/*}
+if [[ $REGISTRY == *-docker.pkg.dev || $REGISTRY == *gcr.io ]]; then
+  docker-credential-gcr configure-docker --registries="$REGISTRY" >/dev/null
+else  # Portward's registry: the license key is the password
+  printf '%s' "$LICENSE" | docker login "$REGISTRY" --username portward --password-stdin >/dev/null
+fi
+unset LICENSE
+for _ in 1 2 3; do docker pull -q "$IMAGE" >/dev/null && break; sleep 10; done
+docker image inspect "$IMAGE" >/dev/null || { log "couldn't pull $IMAGE"; exit 1; }
+rm -rf "$DOCKER_CONFIG"/config.json   # the registry login isn't kept
+
+# --- start (one writer on the records: the old gateway stops before the new one starts) ---
+docker rm -f relay https gateway >/dev/null 2>&1 || true
+docker network inspect portward >/dev/null 2>&1 || docker network create portward >/dev/null
+docker run -d --name gateway --network portward --restart unless-stopped --env-file "$RUN/gateway.env" \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -v "$DISK/config/portward.toml:/config/portward.toml:ro" -v "$DISK/data:/data" "$IMAGE" >/dev/null
+PORTS=()
+[[ $MODE == own-domain ]] && PORTS=(-p 80:80 -p 443:443)
+docker run -d --name https --network portward --restart unless-stopped "$${PORTS[@]}" \
+  -v "$DISK/config/Caddyfile:/etc/caddy/Caddyfile:ro" -v "$DISK/caddy:/data" "$CADDY_IMAGE" >/dev/null
+if [[ $MODE == relay ]]; then
+  docker run -d --name relay --network portward --restart unless-stopped --env-file "$RUN/relay.env" \
+    --read-only --cap-drop ALL --security-opt no-new-privileges \
+    -v "$DISK/config/relay.toml:/etc/frp/frpc.toml:ro" "$RELAY_IMAGE" -c /etc/frp/frpc.toml >/dev/null
+fi
+log "started: $MODE mode, image $IMAGE"
