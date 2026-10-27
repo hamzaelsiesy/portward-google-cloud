@@ -1,0 +1,22 @@
+# Portward gateway, written by the Google Cloud deployment (change settings through it, not here).
+[gateway]
+records_path = "/data/records.db"
+public_url = ${public_url}
+setup_hosts = ${setup_hosts}
+
+[auth]
+directory = ${directory}
+client_id = ${client_id}
+admin_groups = ${admin_groups}
+admin_subjects = ${admin_subjects}
+user_groups = ${user_groups}
+users = ${users}
+scopes = ${scopes}
+
+# Automatic updates (the deployment's auto_update and auto_update_window): `portward update --auto` runs every hour
+# and installs a stable release only inside the window (UTC), 7 days after it reached stable (security fixes at once).
+[updates]
+auto = ${updates_auto}
+scope = ${updates_scope}
+window = ${updates_window}
+timezone = "UTC"

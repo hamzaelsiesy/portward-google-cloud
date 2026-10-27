@@ -1,0 +1,196 @@
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: portward-gateway-on-google-cloud
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  info:
+    title: Portward gateway on Google Cloud
+    source:
+      repo: https://github.com/hamzaelsiesy/portward.git
+      sourceType: git
+      dir: /deploy/gcp
+    actuationTool:
+      flavor: Terraform
+      version: ">= 1.5, < 2.0"
+    description: {}
+  content: {}
+  interfaces:
+    variables:
+      - name: project_id
+        description: The Google Cloud project to deploy the gateway into.
+        varType: string
+        required: true
+      - name: goog_cm_deployment_name
+        description: Name of this deployment; every resource's name starts with it.
+        varType: string
+        defaultValue: portward
+      - name: zone
+        description: The zone for the gateway machine and its records disk.
+        varType: string
+        defaultValue: us-central1-a
+      - name: machine_type
+        description: The gateway's machine. e2-small (2 shared vCPUs, 2 GB) is enough for a team; e2-medium for heavy use.
+        varType: string
+        defaultValue: e2-small
+      - name: source_image
+        description: "The machine image: any image with Docker and the Google guest environment (Container-Optimized OS)."
+        varType: string
+        defaultValue: projects/cos-cloud/global/images/family/cos-stable
+      - name: address_mode
+        description: |
+          How Claude and ChatGPT reach the gateway. "relay": through the Portward relay at https://<name>.gw.portward.ai (the name in your license key)
+          (the gateway connects out; nothing opens inbound; the relay passes traffic through still encrypted). "own-domain":
+          at https://<domain> on a static IP with ports 80 and 443 open (point the domain's DNS at the ip_address output).
+        varType: string
+        defaultValue: relay
+      - name: license_key
+        description: |
+          Your Portward license key, from signing up at portward.ai (pwlic_...). It pulls the image, it is the relay key,
+          and its middle part is your relay name: the gateway is then https://<name>.gw.portward.ai. Kept in Secret Manager.
+        varType: string
+        required: true
+      - name: domain
+        description: "Own-domain mode: the gateway's address, such as portward.example.com (no https://)."
+        varType: string
+        defaultValue: ""
+      - name: relay_host
+        description: "Relay mode: the relay the gateway connects out to."
+        varType: string
+        defaultValue: relay.portward.ai
+      - name: relay_domain
+        description: "Relay mode: the domain the relay gives addresses under."
+        varType: string
+        defaultValue: gw.portward.ai
+      - name: directory_issuer
+        description: |
+          Your company directory's sign-in address (its OpenID Connect issuer), exactly as its
+          /.well-known/openid-configuration states it: https://login.microsoftonline.com/<tenant id>/v2.0 (Entra),
+          https://<org>.okta.com (Okta), https://accounts.google.com (Google Workspace).
+        varType: string
+        required: true
+      - name: directory_client_id
+        description: "The client id of the app registered in your directory for the gateway (redirect address: the redirect_uri output)."
+        varType: string
+        required: true
+      - name: directory_client_secret
+        description: |
+          The app's client secret. Leave empty to keep it out of Terraform's state and add it to Secret Manager yourself
+          (the directory_secret output says how); the gateway waits for it.
+        varType: string
+        defaultValue: ""
+      - name: admin_groups
+        description: "Directory groups whose members manage Portward, as your directory sends them (Entra: group object ids)."
+        varType: list(string)
+        defaultValue: []
+      - name: admin_subjects
+        description: People who manage Portward, by sign-in id (the gateway's log names someone refused) or email.
+        varType: list(string)
+        defaultValue: []
+      - name: user_groups
+        description: Directory groups whose members may ask questions of the data.
+        varType: list(string)
+        defaultValue: []
+      - name: users
+        description: "People who may ask questions of the data: sign-in ids, verified emails or \"@yourcompany.com\". With user_groups empty too: admins only."
+        varType: list(string)
+        defaultValue: []
+      - name: directory_scopes
+        description: "Extra sign-in scopes your directory needs to send groups (Okta: [\"groups\"])."
+        varType: list(string)
+        defaultValue: []
+      - name: setup_hosts
+        description: Database hosts admins may connect from the setup form in Claude or ChatGPT (exact names, or "*.corp.example").
+        varType: list(string)
+        defaultValue: []
+      - name: gateway_image
+        description: "The gateway's container image: from Portward's registry with the license key, or from Artifact Registry with the machine's own identity."
+        varType: string
+        defaultValue: registry.portward.ai/portward/gateway:1.1.0@sha256:ccce2c27069a1a11e33993658a4517721ddf9003c720f190c00ef28c9646478e
+      - name: records_disk_gb
+        description: Size of the encrypted disk holding the gateway's records, setup and saved connections.
+        varType: number
+        defaultValue: 10
+      - name: disk_kms_key
+        description: "Optional: a Cloud KMS key (projects/.../cryptoKeys/...) to encrypt the records disk with, instead of Google's."
+        varType: string
+        defaultValue: ""
+      - name: backup_retention_days
+        description: How many days the records disk's daily snapshots are kept. Snapshots are kept when the disk is deleted.
+        varType: number
+        defaultValue: 14
+      - name: backup_time_utc
+        description: When the daily snapshot starts (UTC, on the hour).
+        varType: string
+        defaultValue: "03:00"
+      - name: auto_update
+        description: |
+          Install new gateway releases by themselves: off (only someone running `sudo bash /mnt/disks/portward/portward-gcp update`
+          on the machine moves it), patch (fixes to the running version) or all (minor releases too; a major release always
+          waits). A release installs 7 days after it reaches stable (a security fix at once), inside the window, and goes back
+          by itself if it isn't ready.
+        varType: string
+        defaultValue: "off"
+      - name: auto_update_window
+        description: When automatic updates may start (UTC), a day (Mon ... Sun, several as "Sat,Sun", or "daily") and a time. The window stays open 3 hours.
+        varType: string
+        defaultValue: "Sun 03:00"
+      - name: keep_key_on_destroy
+        description: |
+          Protect the gateway key in Secret Manager from deletion. The key opens the saved connections in the records and
+          their snapshots: without it, a restored snapshot can't be used. Set false (and apply) before removing everything.
+        varType: bool
+        defaultValue: true
+      - name: subnetwork
+        description: |
+          Optional: an existing subnetwork (projects/<p>/regions/<r>/subnetworks/<name>) to run in, such as the one that
+          reaches your databases. Empty: a new network with no inbound access except what address_mode needs.
+        varType: string
+        defaultValue: ""
+      - name: public_ip
+        description: Give the machine a public IP for its outbound connections. Set false only if the subnetwork has Cloud NAT.
+        varType: bool
+        defaultValue: true
+      - name: allow_iap_ssh
+        description: "Allow SSH through Identity-Aware Proxy (for gcloud compute ssh --tunnel-through-iap). Off: no SSH at all."
+        varType: bool
+        defaultValue: false
+      - name: labels
+        description: Labels added to every resource.
+        varType: map(string)
+        defaultValue: {}
+    outputs:
+      - name: admin_connector
+        description: Add in Claude or ChatGPT, for admins (setup and what the AI may see).
+      - name: data_connector
+        description: Add in Claude or ChatGPT, for people asking questions.
+      - name: gateway_url
+        description: The gateway's address.
+      - name: ip_address
+        description: "Own-domain mode: point the domain's DNS A record here. Relay mode: none (nothing opens inbound)."
+      - name: key_secret
+        description: The gateway key, generated on the machine at first start. Back it up apart from the records.
+      - name: logs
+        description: The gateway's logs (a refused sign-in names the id to add to admin_subjects or users).
+      - name: machine
+        description: The gateway machine.
+      - name: redirect_uri
+        description: The redirect address of the app registered in your directory.
+      - name: secrets_to_add
+        description: "Secrets the deployment left empty: add each with the command shown; the gateway waits for them."
+  requirements:
+    roles:
+      - level: Project
+        roles:
+          - roles/compute.admin
+          - roles/iam.serviceAccountAdmin
+          - roles/iam.serviceAccountUser
+          - roles/resourcemanager.projectIamAdmin
+          - roles/secretmanager.admin
+          - roles/serviceusage.serviceUsageAdmin
+    services:
+      - compute.googleapis.com
+      - secretmanager.googleapis.com
+      - iam.googleapis.com
+      - cloudresourcemanager.googleapis.com
