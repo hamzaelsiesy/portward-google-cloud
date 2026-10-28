@@ -1,0 +1,202 @@
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: portward-gateway-on-google-cloud-display
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  info:
+    title: Portward gateway
+    source:
+      repo: https://github.com/hamzaelsiesy/portward.git
+      sourceType: git
+      dir: /deploy/gcp
+  ui:
+    input:
+      variables:
+        address_mode:
+          name: address_mode
+          title: "How Claude and ChatGPT reach it"
+          section: address
+          enumValueLabels:
+            - label: Through the Portward relay (nothing opens inbound)
+              value: relay
+            - label: At my own domain (ports 80 and 443)
+              value: own-domain
+        admin_groups:
+          name: admin_groups
+          title: "Admin groups"
+          section: signin
+        admin_subjects:
+          name: admin_subjects
+          title: "Admins (ids or emails)"
+          section: signin
+        allow_iap_ssh:
+          name: allow_iap_ssh
+          title: "Allow SSH through Identity-Aware Proxy"
+          section: advanced
+          level: 1
+        auto_update:
+          name: auto_update
+          title: "Automatic updates"
+          section: updates
+          enumValueLabels:
+            - label: "Off: someone runs the update"
+              value: "off"
+            - label: Fixes to the running version (1.1.0 to 1.1.1)
+              value: patch
+            - label: Fixes and minor releases (1.1 to 1.2)
+              value: all
+        auto_update_window:
+          name: auto_update_window
+          title: "Update window (UTC)"
+          section: updates
+          level: 1
+        backup_retention_days:
+          name: backup_retention_days
+          title: "Days to keep daily snapshots"
+          section: data
+          min: 1
+          max: 365
+        backup_time_utc:
+          name: backup_time_utc
+          title: "Daily snapshot time (UTC)"
+          section: data
+          level: 1
+        directory_client_id:
+          name: directory_client_id
+          title: "App client id"
+          section: signin
+        directory_client_secret:
+          name: directory_client_secret
+          title: "App client secret"
+          section: signin
+          subtext: Or leave empty and add it to Secret Manager after deploying.
+        directory_issuer:
+          name: directory_issuer
+          title: "Directory sign-in address (issuer)"
+          section: signin
+          placeholder: https://login.microsoftonline.com/<tenant id>/v2.0
+        directory_scopes:
+          name: directory_scopes
+          title: "Extra sign-in scopes"
+          section: signin
+          level: 1
+        disk_kms_key:
+          name: disk_kms_key
+          title: "Disk encryption key (Cloud KMS, optional)"
+          section: data
+          level: 1
+        domain:
+          name: domain
+          title: "Own domain"
+          section: address
+          placeholder: portward.example.com
+        gateway_image:
+          name: gateway_image
+          title: "Gateway image"
+          section: advanced
+          level: 1
+        goog_cm_deployment_name:
+          name: goog_cm_deployment_name
+          title: "Deployment name"
+          section: where
+        keep_key_on_destroy:
+          name: keep_key_on_destroy
+          title: "Protect the gateway key from deletion"
+          section: data
+        labels:
+          name: labels
+          title: "Labels"
+          section: advanced
+          level: 1
+        machine_type:
+          name: machine_type
+          title: "Machine type"
+          section: where
+          xGoogleProperty:
+            type: ET_GCE_MACHINE_TYPE
+            zoneProperty: zone
+            gceMachineType:
+              minCpu: 1
+              minRamGb: 1
+        project_id:
+          name: project_id
+          title: "Project"
+          section: where
+          invisible: true
+        public_ip:
+          name: public_ip
+          title: "Public IP for outbound connections"
+          section: advanced
+          level: 1
+        records_disk_gb:
+          name: records_disk_gb
+          title: "Records disk (GB)"
+          section: data
+          min: 10
+          max: 1000
+        relay_domain:
+          name: relay_domain
+          title: "Relay domain"
+          section: address
+          level: 1
+        relay_host:
+          name: relay_host
+          title: "Relay host"
+          section: address
+          level: 1
+        license_key:
+          name: license_key
+          title: "License key (from signing up at portward.ai)"
+          section: address
+          placeholder: pwlic_...
+        setup_hosts:
+          name: setup_hosts
+          title: "Database hosts admins may connect"
+          section: data
+        source_image:
+          name: source_image
+          title: "Machine image"
+          section: where
+          invisible: true
+          xGoogleProperty:
+            type: ET_GCE_DISK_IMAGE
+        subnetwork:
+          name: subnetwork
+          title: "Existing subnetwork (optional)"
+          section: advanced
+          level: 1
+        user_groups:
+          name: user_groups
+          title: "User groups"
+          section: signin
+        users:
+          name: users
+          title: "Users (ids, emails or @yourcompany.com)"
+          section: signin
+        zone:
+          name: zone
+          title: "Zone"
+          section: where
+          xGoogleProperty:
+            type: ET_GCE_ZONE
+      sections:
+        - name: where
+          title: Machine
+          subtext: "Where the gateway runs."
+        - name: address
+          title: Address
+          subtext: "The gateway's https address for Claude and ChatGPT."
+        - name: signin
+          title: Sign-in
+          subtext: "Your company directory and the app registered in it (redirect address: https://<address>/auth/callback)."
+        - name: data
+          title: Records and backups
+          subtext: "The encrypted records disk, its daily snapshots and the gateway key."
+        - name: updates
+          title: Updates
+          subtext: "Whether new gateway releases install by themselves: 7 days after they reach stable, inside the window, back again if not ready."
+        - name: advanced
+          title: Advanced
+          subtext: "Image, network and labels."
