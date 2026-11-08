@@ -1,0 +1,332 @@
+#!/bin/bash
+# Portward gateway machine: runs at every boot (Google guest environment). Mounts the records disk, reads the
+# secrets from Secret Manager with the machine's own identity (generating the gateway key the first time), and
+# (re)starts the gateway, Caddy (HTTPS) and, in relay mode, the relay client with Docker Compose. Settings come from
+# the deployment: a change there replaces the machine; the records disk and the key carry over.
+#
+# A restart starts the images already on the machine: nothing is pulled unless it's missing. The gateway's image is
+# the deployment's (gateway_image) until `portward update` moves it; the image it moved to stays across restarts until
+# the deployment names another image of the same release or newer (an older one is skipped: going back on purpose is
+# `update --to X.Y.Z`, which returns to the newer release if the older one isn't ready). A copy of this script is kept
+# on the records disk for that:
+#   sudo bash /mnt/disks/portward/portward-gcp update [--check | --to X.Y.Z]
+# With the deployment's auto_update on, a timer runs `update --auto` every hour (schedule_updates).
+# Rendered by Terraform: $${...} is a shell expansion, the rest was filled in at deploy time.
+set -euo pipefail
+umask 077
+
+PROJECT=${project}
+MODE=${mode}
+IMAGE=${gateway_image}
+CADDY_IMAGE=${caddy_image}
+RELAY_IMAGE=${relay_image}
+KEY_SECRET=${key_secret}
+DIRECTORY_SECRET=${directory_secret}
+LICENSE_SECRET=${license_secret}
+AUTO_UPDATE=${auto_update}
+DEVICE=/dev/disk/by-id/google-${disk_device}
+DISK=/mnt/disks/portward
+INSTALL=$DISK/config        # compose.yaml, portward.toml, Caddy and relay settings, the last update's status
+COMPOSE=$INSTALL/compose.yaml
+RUN=/run/portward           # tmpfs: secrets for the containers, never on a disk
+UNITS=/etc/systemd/system   # Container-Optimized OS keeps /etc only until the next boot: start() writes it each time
+CRON_DIR=/etc/cron.d
+MD=http://metadata.google.internal/computeMetadata/v1
+SM=https://secretmanager.googleapis.com/v1/projects/$PROJECT/secrets
+export DOCKER_CONFIG=$RUN/docker
+
+log() { echo "portward: $*" >&2; }
+
+token() {
+  curl -sSf -H 'Metadata-Flavor: Google' "$MD/instance/service-accounts/default/token" \
+    | sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p'
+}
+
+# A secret's latest value on stdout. Exit 3 when it has no value yet; retries anything else.
+secret() {
+  local body code tries=0
+  while :; do
+    body=$(mktemp -p "$RUN")
+    code=$(curl -sS -o "$body" -w '%%{http_code}' -H "Authorization: Bearer $(token)" \
+      "$SM/$1/versions/latest:access" || echo 000)
+    if [[ $code == 200 ]]; then
+      sed -n 's/.*"data" *: *"\([^"]*\)".*/\1/p' "$body" | base64 -d
+      rm -f "$body"; return 0
+    fi
+    rm -f "$body"
+    [[ $code == 404 || $code == 400 ]] && return 3   # no version (400: the latest one is disabled or destroyed)
+    tries=$((tries + 1)); (( tries < 10 )) || { log "Secret Manager answered $code for $1"; return 1; }
+    sleep 6
+  done
+}
+
+# Waits until someone adds a value to a secret the deployment left empty.
+wait_secret() {
+  local value status
+  while :; do
+    set +e; value=$(secret "$1"); status=$?; set -e
+    [[ $status == 0 ]] && { printf '%s' "$value"; return 0; }
+    [[ $status == 3 ]] || exit 1
+    log "waiting for secret $1: gcloud secrets versions add $1 --project $PROJECT --data-file=<file>"
+    sleep 30
+  done
+}
+
+# KEY=value from a value that is either just the value or a file of KEY=value lines (as Portward sends them).
+field() {
+  if grep -q "^$1=" <<<"$2"; then sed -n "s/^$1=//p" <<<"$2" | head -n1 | tr -d '\r'; else printf '%s' "$2" | tr -d '\r\n'; fi
+}
+
+# The gateway image compose.yaml runs (what `portward update` last moved it to), or nothing.
+running_image() {
+  [[ -f $COMPOSE ]] && sed -n '/^  gateway:$/{n;s/^    image: //p;q;}' "$COMPOSE"
+}
+
+# Signs in to the registry an image comes from, for this run only ($DOCKER_CONFIG is in memory): Portward's with the
+# license key, Artifact Registry with the machine's own identity.
+login() {
+  local registry=$${1%%/*}
+  mkdir -p "$DOCKER_CONFIG"
+  if [[ $registry == *-docker.pkg.dev || $registry == *gcr.io ]]; then
+    token | docker login "$registry" --username oauth2accesstoken --password-stdin >/dev/null
+  else  # Portward's registry: the license key is the password
+    printf '%s' "$2" | docker login "$registry" --username portward --password-stdin >/dev/null
+  fi
+}
+
+logout() { rm -rf "$DOCKER_CONFIG"; }   # the registry login isn't kept
+
+license() {
+  local value
+  value=$(wait_secret "$LICENSE_SECRET" | tr -d '\r\n')
+  [[ $value =~ ^pwlic_[a-z0-9][a-z0-9-]{1,40}_[0-9a-f]{64}$ ]] || { log "$LICENSE_SECRET doesn't hold a license key"; exit 1; }
+  printf '%s' "$value"
+}
+
+# An image's release (1.2.0, or 1.2.0-rc.1 when its tag says so) and the order of two, by `portward update`'s own
+# rules, run in the image that update moved the gateway to ($2). Exit 10: $1 is the same release as $2 or newer;
+# 11: older; anything else: no way to tell (an image without a version label, or one too old to have the rules).
+not_older() {
+  local label='{{index .Config.Labels "org.opencontainers.image.version"}}'
+  docker run --rm --network none --entrypoint python "$2" -c 'import sys
+from portward.update import image_release, precedence
+new, old = image_release(sys.argv[1], sys.argv[2]), image_release(sys.argv[3], sys.argv[4])
+sys.exit(12 if not (new and old) else 10 if precedence(new) >= precedence(old) else 11)' \
+    "$1" "$(docker image inspect -f "$label" "$1")" "$2" "$(docker image inspect -f "$label" "$2")"
+}
+
+# The gateway's image: the one `portward update` moved it to ($1, from compose.yaml) until the deployment names
+# another image of the same release or newer. An older one would start the gateway on a file a newer version may have
+# migrated, with nothing to bring the newer one back if it doesn't start, so it's skipped (and said so).
+gateway_image() {
+  local kept=$1 order
+  if [[ -z $kept || $kept == "$IMAGE" ]]; then printf '%s' "$IMAGE"; return; fi
+  if [[ $(cat "$INSTALL/template-image" 2>/dev/null) == "$IMAGE" ]]; then printf '%s' "$kept"; return; fi
+  set +e; not_older "$IMAGE" "$kept" >&2; order=$?; set -e
+  case $order in
+    10) printf '%s' "$IMAGE" ;;
+    11) log "gateway_image $IMAGE is older than $kept, which portward update moved the gateway to: keeping $kept" \
+          "(to go back on purpose: sudo bash $DISK/portward-gcp update --to X.Y.Z)"
+        printf '%s' "$kept" ;;
+    *) log "can't tell whether gateway_image $IMAGE is older than $kept: starting $IMAGE, as the deployment names it"
+       printf '%s' "$IMAGE" ;;
+  esac
+}
+
+# Pulls an image only when the machine doesn't have it (docker image inspect first).
+have() {
+  docker image inspect "$1" >/dev/null 2>&1 && return 0
+  for _ in 1 2 3; do docker pull -q "$1" >/dev/null && break; sleep 10; done
+  docker image inspect "$1" >/dev/null 2>&1 || { log "couldn't pull $1"; exit 1; }
+}
+
+# Docker Compose from the gateway image (Container-Optimized OS has Docker but not Compose).
+compose() {
+  docker run --rm --user 0:0 -v /var/run/docker.sock:/var/run/docker.sock -v "$DISK:$DISK" -v "$RUN:$RUN:ro" \
+    --entrypoint docker "$IMAGE" compose --project-directory "$INSTALL" -f "$COMPOSE" "$@"
+}
+
+write_compose() {  # $1: the gateway image
+  local ports="" relay=""
+  [[ $MODE == own-domain ]] && ports='    ports: ["80:80", "443:443"]'
+  if [[ $MODE == relay ]]; then
+    relay="  relay:
+    image: $RELAY_IMAGE
+    restart: unless-stopped
+    env_file: $RUN/relay.env
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - $INSTALL/relay.toml:/etc/frp/frpc.toml:ro
+    command: [-c, /etc/frp/frpc.toml]"
+  fi
+  cat > "$COMPOSE.partial" <<PORTWARD_EOF
+# Written at every boot by the deployment's startup script. \`portward update\` moves the gateway's image line.
+name: portward
+services:
+  gateway:
+    image: $1
+    restart: unless-stopped
+    env_file: $RUN/gateway.env
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - $INSTALL/portward.toml:/config/portward.toml:ro
+      - $DISK/data:/data
+  https:
+    image: $CADDY_IMAGE
+    restart: unless-stopped
+$ports
+    volumes:
+      - $INSTALL/Caddyfile:/etc/caddy/Caddyfile:ro
+      - $DISK/caddy:/data
+    depends_on: [gateway]
+$relay
+PORTWARD_EOF
+  sed -i '/^$/d' "$COMPOSE.partial"
+  chmod 644 "$COMPOSE.partial"
+  mv "$COMPOSE.partial" "$COMPOSE"
+}
+
+# Opt-in automatic updates (auto_update): every hour `portward update --auto` decides by portward.toml's [updates]
+# (the window, 7 days on stable, patch or all) and installs only what they allow. A systemd timer; a cron entry where
+# there is no systemd unit folder. Off: the schedule an earlier setting left on an image whose /etc survives a reboot
+# is taken away (update() skips an --auto run without Docker while it is off, too).
+schedule_updates() {
+  if [[ $AUTO_UPDATE != true ]]; then
+    if [[ -e $UNITS/portward-update.timer ]]; then
+      systemctl disable --now portward-update.timer || true
+      rm -f "$UNITS/portward-update.timer" "$UNITS/portward-update.service"
+      systemctl daemon-reload || true
+    fi
+    rm -f "$CRON_DIR/portward-update"
+    return 0
+  fi
+  if [[ -d $UNITS ]] && command -v systemctl >/dev/null; then
+    cat > "$UNITS/portward-update.service" <<PORTWARD_EOF
+[Unit]
+Description=Portward scheduled update (portward update --auto)
+Wants=docker.service
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $DISK/portward-gcp update --auto
+PORTWARD_EOF
+    cat > "$UNITS/portward-update.timer" <<PORTWARD_EOF
+[Unit]
+Description=Hourly Portward update check (installs only what [updates] in portward.toml allows)
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10min
+[Install]
+WantedBy=timers.target
+PORTWARD_EOF
+    systemctl daemon-reload
+    systemctl enable --now portward-update.timer
+  else
+    printf '7 * * * * root /bin/bash %s/portward-gcp update --auto 2>&1 | logger -t portward-update\n' "$DISK" \
+      > "$CRON_DIR/portward-update"
+  fi
+  log "automatic updates on: portward update --auto every hour"
+}
+
+start() {
+  mkdir -p "$RUN"
+  mount | grep -q " $RUN " || mount -t tmpfs -o size=4m,mode=0700 tmpfs "$RUN"
+
+  # --- the records disk (encrypted; snapshotted daily) ---
+  for _ in $(seq 60); do [[ -e $DEVICE ]] && break; sleep 2; done
+  [[ -e $DEVICE ]] || { log "records disk $DEVICE isn't attached"; exit 1; }
+  if ! blkid "$DEVICE" >/dev/null 2>&1; then
+    log "formatting the new records disk"
+    mkfs.ext4 -q -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "$DEVICE"
+  fi
+  mkdir -p "$DISK"
+  mountpoint -q "$DISK" || mount -o discard,defaults,nodev,nosuid "$DEVICE" "$DISK"
+  mkdir -p "$DISK/data" "$DISK/caddy" "$DISK/config"
+  chown 10001:10001 "$DISK/data"; chmod 700 "$DISK/data"   # the gateway image's user
+
+  # --- secrets ---
+  set +e; KEY=$(secret "$KEY_SECRET"); status=$?; set -e
+  if [[ $status == 3 ]]; then  # first boot: generate the key here, so it exists only in this project
+    log "generating the gateway key in Secret Manager ($KEY_SECRET)"
+    KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    printf '{"payload":{"data":"%s"}}' "$(printf '%s' "$KEY" | base64 -w0)" > "$RUN/key.json"
+    curl -sSf -o /dev/null -X POST -H "Authorization: Bearer $(token)" -H 'Content-Type: application/json' \
+      --data-binary @"$RUN/key.json" "$SM/$KEY_SECRET:addVersion"
+    rm -f "$RUN/key.json"
+    KEY=$(secret "$KEY_SECRET")
+  elif [[ $status != 0 ]]; then exit 1; fi
+  [[ $${#KEY} -ge 32 ]] || { log "the key in $KEY_SECRET is too short"; exit 1; }
+  RAW=$(wait_secret "$DIRECTORY_SECRET")
+  DIRECTORY=$(field PORTWARD_DIRECTORY_SECRET "$RAW")
+  printf 'PORTWARD_KEY=%s\nPORTWARD_DIRECTORY_SECRET=%s\nFORWARDED_ALLOW_IPS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7,127.0.0.0/8,::1\n' "$KEY" "$DIRECTORY" > "$RUN/gateway.env"
+  unset KEY DIRECTORY RAW
+  # The license key: the image pull password and the relay key.
+  LICENSE=$(license)
+  [[ $MODE == relay ]] && printf 'RELAY_TOKEN=%s\n' "$LICENSE" > "$RUN/relay.env"
+
+  # --- settings ---
+  cat > "$DISK/config/portward.toml" <<'PORTWARD_EOF'
+${portward_toml}
+PORTWARD_EOF
+  cat > "$DISK/config/Caddyfile" <<'PORTWARD_EOF'
+${caddyfile}
+PORTWARD_EOF
+  cat > "$DISK/config/relay.toml" <<'PORTWARD_EOF'
+${relay_toml}
+PORTWARD_EOF
+  chmod 644 "$INSTALL/portward.toml" "$INSTALL/Caddyfile" "$INSTALL/relay.toml"
+
+  # --- the images: the gateway keeps the image an update moved it to, unless the deployment names a newer one ---
+  local kept gateway
+  kept=$(running_image) || true
+  [[ $kept != "$IMAGE" ]] || kept=""
+  login "$IMAGE" "$LICENSE"
+  [[ -z $kept || $${kept%%/*} == "$${IMAGE%%/*}" ]] || login "$kept" "$LICENSE"
+  unset LICENSE
+  have "$IMAGE"; [[ -z $kept ]] || have "$kept"; have "$CADDY_IMAGE"
+  [[ $MODE != relay ]] || have "$RELAY_IMAGE"
+  logout
+  gateway=$(gateway_image "$kept")
+  write_compose "$gateway"
+  curl -sSf -H 'Metadata-Flavor: Google' "$MD/instance/attributes/startup-script" > "$DISK/portward-gcp.partial" \
+    && mv "$DISK/portward-gcp.partial" "$DISK/portward-gcp" && chmod 700 "$DISK/portward-gcp"
+
+  # --- start (one writer on the records: the old gateway stops before the new one starts) ---
+  docker rm -f relay https gateway >/dev/null 2>&1 || true   # the containers of a machine set up before Compose
+  compose up -d --remove-orphans --pull never
+  printf '%s\n' "$IMAGE" > "$INSTALL/template-image"
+  log "started: $MODE mode, gateway image $gateway"
+  schedule_updates
+}
+
+# `portward update`, run from the gateway's current image with this machine's Docker (for this run only): checks the
+# release's signature, keeps a copy of the records, and goes back if the new version isn't ready.
+update() {
+  local running key status
+  if [[ $${1:-} == --auto ]] \
+       && ! grep -Eq '^[[:space:]]*auto[[:space:]]*=[[:space:]]*true([[:space:]]|#|$)' "$INSTALL/portward.toml"; then
+    return 0   # automatic updates are off: no container, no registry sign-in
+  fi
+  running=$(running_image) || true
+  [[ -n $running ]] || { log "no gateway runs from $COMPOSE yet: it starts at boot"; exit 1; }
+  key=$(license)
+  login "$running" "$key"
+  unset key
+  set +e
+  docker run --rm --user 0:0 -e HOME=/tmp -e DOCKER_CONFIG=/docker \
+    -v "$DOCKER_CONFIG/config.json:/docker/config.json:ro" -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$DISK:$DISK" -v "$RUN:$RUN:ro" --entrypoint portward "$running" update --dir "$INSTALL" "$@"
+  status=$?
+  set -e
+  rm -rf "$DOCKER_CONFIG"
+  return $status
+}
+
+case $${1:-start} in
+  start) start ;;
+  update) shift; update "$@" ;;
+  *) sed -n '2,13p' "$0"; exit 2 ;;
+esac

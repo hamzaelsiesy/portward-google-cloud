@@ -1,0 +1,18 @@
+# Connects out to the Portward relay; nothing opens inbound. The relay forwards ${domain} here still encrypted.
+serverAddr = "${relay_host}"
+serverPort = 443
+loginFailExit = false
+user = "${relay_name}"
+metadatas.token = "{{ .Envs.RELAY_TOKEN }}"
+transport.tls.enable = true
+transport.tls.serverName = "${relay_host}"
+transport.tls.trustedCaFile = "/etc/ssl/certs/ca-certificates.crt"
+transport.tls.disableCustomTLSFirstByte = false
+
+[[proxies]]
+name = "gateway"
+type = "https"
+subdomain = "${relay_name}"
+localIP = "https"
+localPort = 443
+transport.proxyProtocolVersion = "v2"   # tells Caddy each visitor's real address
